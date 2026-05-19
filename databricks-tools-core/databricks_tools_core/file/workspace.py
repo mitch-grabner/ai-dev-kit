@@ -1,10 +1,11 @@
 """
 File - Workspace File Operations
 
-Functions for uploading files and folders to Databricks Workspace.
+Functions for managing files, folders, and notebooks in Databricks Workspace.
 Uses Databricks Workspace API via SDK.
 """
 
+import base64
 import glob
 import io
 import os
@@ -15,9 +16,13 @@ from pathlib import Path
 from typing import List, Optional
 
 from databricks.sdk import WorkspaceClient
-import base64
-
-from databricks.sdk.service.workspace import ImportFormat, Language
+from databricks.sdk.service.workspace import (
+    ExportFormat,
+    ImportFormat,
+    Language,
+    ObjectInfo,
+    ObjectType,
+)
 
 from ..auth import get_workspace_client
 
@@ -38,6 +43,22 @@ EXCLUDED_DIRS = frozenset({
     ".eggs",
     "*.egg-info",
 })
+
+_VALID_EXPORT_FORMATS = {format_.name for format_ in ExportFormat}
+_DIRECTORY_EXPORT_FORMATS = {"AUTO", "DBC", "SOURCE"}
+_VALID_OBJECT_TYPES = {object_type.name for object_type in ObjectType}
+_EXPORT_EXTENSIONS = {
+    "DBC": ".dbc",
+    "HTML": ".html",
+    "JUPYTER": ".ipynb",
+    "R_MARKDOWN": ".Rmd",
+}
+_LANGUAGE_SOURCE_EXTENSIONS = {
+    "PYTHON": ".py",
+    "SQL": ".sql",
+    "SCALA": ".scala",
+    "R": ".r",
+}
 
 
 @dataclass
@@ -80,6 +101,53 @@ class DeleteResult:
     error: Optional[str] = None
 
 
+@dataclass
+class WorkspaceObjectInfo:
+    """Serializable workspace object metadata."""
+
+    path: str
+    object_type: Optional[str] = None
+    language: Optional[str] = None
+    size: Optional[int] = None
+    created_at: Optional[int] = None
+    modified_at: Optional[int] = None
+    object_id: Optional[int] = None
+    error: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "path": self.path,
+            "object_type": self.object_type,
+            "language": self.language,
+            "size": self.size,
+            "created_at": self.created_at,
+            "modified_at": self.modified_at,
+            "object_id": self.object_id,
+            "error": self.error,
+        }
+
+
+@dataclass
+class WorkspaceListResult:
+    """Result from listing workspace objects."""
+
+    objects: List[WorkspaceObjectInfo] = field(default_factory=list)
+    returned_count: int = 0
+    truncated: bool = False
+    error: Optional[str] = None
+
+
+@dataclass
+class WorkspaceDownloadResult:
+    """Result from downloading/exporting a workspace object."""
+
+    workspace_path: str
+    local_path: str
+    export_format: str
+    success: bool
+    error: Optional[str] = None
+
+
 # Notebook markers for each language
 _NOTEBOOK_MARKERS = {
     Language.PYTHON: b"# Databricks notebook source",
@@ -87,6 +155,294 @@ _NOTEBOOK_MARKERS = {
     Language.SCALA: b"// Databricks notebook source",
     Language.R: b"# Databricks notebook source",
 }
+
+
+def _enum_name(value) -> Optional[str]:
+    """Return enum name/value as a plain string for SDK enum fields."""
+    if value is None:
+        return None
+    if hasattr(value, "name"):
+        return value.name
+    if hasattr(value, "value"):
+        return value.value
+    text = str(value)
+    if "." in text:
+        return text.rsplit(".", 1)[-1]
+    return text
+
+
+def _object_info_to_workspace_info(info: ObjectInfo) -> WorkspaceObjectInfo:
+    """Convert SDK ObjectInfo to the public serializable shape."""
+    return WorkspaceObjectInfo(
+        path=info.path or "",
+        object_type=_enum_name(info.object_type),
+        language=_enum_name(info.language),
+        size=info.size,
+        created_at=info.created_at,
+        modified_at=info.modified_at,
+        object_id=info.object_id,
+    )
+
+
+def _normalize_workspace_path(workspace_path: str) -> str:
+    """Normalize workspace paths while preserving root slash."""
+    path = workspace_path.rstrip("/")
+    return path or "/"
+
+
+def _matches_filters(info: WorkspaceObjectInfo, object_type_filter: Optional[str], name_contains: Optional[str]) -> bool:
+    if object_type_filter and info.object_type != object_type_filter:
+        return False
+    if name_contains and name_contains.lower() not in Path(info.path).name.lower():
+        return False
+    return True
+
+
+def _validate_object_type_filter(object_type_filter: Optional[str]) -> Optional[str]:
+    if not object_type_filter:
+        return None
+    normalized = object_type_filter.upper()
+    if normalized not in _VALID_OBJECT_TYPES:
+        raise ValueError(
+            f"Invalid object_type_filter '{object_type_filter}'. "
+            f"Valid values: {', '.join(sorted(_VALID_OBJECT_TYPES))}"
+        )
+    return normalized
+
+
+def _validate_export_format(export_format: str) -> str:
+    normalized = (export_format or "SOURCE").upper()
+    if normalized not in _VALID_EXPORT_FORMATS:
+        raise ValueError(
+            f"Invalid export_format '{export_format}'. "
+            f"Valid values: {', '.join(sorted(_VALID_EXPORT_FORMATS))}"
+        )
+    return normalized
+
+
+def _default_download_filename(
+    workspace_path: str,
+    info: WorkspaceObjectInfo,
+    export_format: str,
+    response_file_type: Optional[str],
+) -> str:
+    basename = Path(workspace_path.rstrip("/")).name or "workspace_export"
+    object_type = info.object_type or ""
+    response_type = (response_file_type or "").lower()
+
+    if object_type == "DIRECTORY":
+        extension = ".dbc" if export_format == "DBC" else ".zip"
+    elif export_format == "SOURCE":
+        extension = _LANGUAGE_SOURCE_EXTENSIONS.get(info.language or "", "")
+    elif export_format == "RAW":
+        extension = ""
+    else:
+        extension = _EXPORT_EXTENSIONS.get(export_format, "")
+
+    if response_type and not extension:
+        extension = f".{response_type.lstrip('.')}"
+
+    if extension and not basename.lower().endswith(extension.lower()):
+        return f"{basename}{extension}"
+    return basename
+
+
+def _resolve_download_path(
+    local_destination: str,
+    workspace_path: str,
+    info: WorkspaceObjectInfo,
+    export_format: str,
+    response_file_type: Optional[str],
+) -> str:
+    destination = os.path.expanduser(local_destination)
+    ends_as_dir = destination.endswith(("/", os.sep))
+    if os.path.isdir(destination) or ends_as_dir:
+        filename = _default_download_filename(workspace_path, info, export_format, response_file_type)
+        return os.path.join(destination, filename)
+    return destination
+
+
+def list_workspace_objects(
+    workspace_path: str,
+    recursive: bool = False,
+    object_type_filter: Optional[str] = None,
+    name_contains: Optional[str] = None,
+    notebooks_modified_after: Optional[int] = None,
+    max_results: int = 100,
+) -> WorkspaceListResult:
+    """
+    List workspace files, folders, notebooks, repos, libraries, or dashboards.
+
+    Args:
+        workspace_path: Workspace path to list.
+        recursive: If True, recursively walks directory objects.
+        object_type_filter: Optional object type filter. Valid values:
+            DIRECTORY, FILE, NOTEBOOK, REPO, LIBRARY, DASHBOARD.
+        name_contains: Optional case-insensitive substring filter on basename.
+        notebooks_modified_after: Optional UTC timestamp in milliseconds.
+        max_results: Maximum returned objects. One extra object is probed to
+            report truncation.
+
+    Returns:
+        WorkspaceListResult with serializable objects and truncation status.
+    """
+    workspace_path = _normalize_workspace_path(workspace_path)
+    capped_max = max(1, max_results)
+
+    try:
+        normalized_filter = _validate_object_type_filter(object_type_filter)
+        w = get_workspace_client()
+        collected: List[WorkspaceObjectInfo] = []
+        truncated = False
+
+        def add_if_match(raw_info: ObjectInfo) -> None:
+            nonlocal truncated
+            if truncated:
+                return
+            info = _object_info_to_workspace_info(raw_info)
+            if _matches_filters(info, normalized_filter, name_contains):
+                collected.append(info)
+                if len(collected) > capped_max:
+                    truncated = True
+
+        def walk(path: str) -> None:
+            nonlocal truncated
+            if truncated:
+                return
+            for raw_info in w.workspace.list(path=path, notebooks_modified_after=notebooks_modified_after):
+                add_if_match(raw_info)
+                raw_type = _enum_name(raw_info.object_type)
+                if recursive and raw_type == "DIRECTORY" and raw_info.path:
+                    walk(raw_info.path)
+                if truncated:
+                    return
+
+        walk(workspace_path)
+        return WorkspaceListResult(
+            objects=collected[:capped_max],
+            returned_count=min(len(collected), capped_max),
+            truncated=truncated,
+        )
+    except Exception as e:
+        return WorkspaceListResult(error=str(e))
+
+
+def get_workspace_object_info(workspace_path: str) -> WorkspaceObjectInfo:
+    """
+    Get metadata for a workspace object.
+
+    Args:
+        workspace_path: Workspace path to inspect.
+
+    Returns:
+        WorkspaceObjectInfo with metadata or an error field.
+    """
+    workspace_path = _normalize_workspace_path(workspace_path)
+    try:
+        w = get_workspace_client()
+        return _object_info_to_workspace_info(w.workspace.get_status(path=workspace_path))
+    except Exception as e:
+        return WorkspaceObjectInfo(path=workspace_path, error=str(e))
+
+
+def download_from_workspace(
+    workspace_path: str,
+    local_destination: str,
+    export_format: str = "SOURCE",
+    overwrite: bool = True,
+    recursive: bool = False,
+) -> WorkspaceDownloadResult:
+    """
+    Export a Databricks workspace object to a local file.
+
+    Args:
+        workspace_path: Workspace object or directory path.
+        local_destination: Local file path or directory. If this is a directory
+            or ends with a slash, a filename is derived from the workspace object
+            and export format.
+        export_format: Workspace export format. Defaults to SOURCE.
+        overwrite: Whether to overwrite an existing local file.
+        recursive: Required for directory exports.
+
+    Returns:
+        WorkspaceDownloadResult with success status and final local path.
+    """
+    workspace_path = _normalize_workspace_path(workspace_path)
+    try:
+        normalized_format = _validate_export_format(export_format)
+    except ValueError as e:
+        return WorkspaceDownloadResult(
+            workspace_path=workspace_path,
+            local_path=os.path.expanduser(local_destination),
+            export_format=(export_format or "SOURCE").upper(),
+            success=False,
+            error=str(e),
+        )
+
+    try:
+        w = get_workspace_client()
+        info = _object_info_to_workspace_info(w.workspace.get_status(path=workspace_path))
+        if info.object_type == "DIRECTORY":
+            if not recursive:
+                return WorkspaceDownloadResult(
+                    workspace_path=workspace_path,
+                    local_path=os.path.expanduser(local_destination),
+                    export_format=normalized_format,
+                    success=False,
+                    error="Directory download requires recursive=True.",
+                )
+            if normalized_format not in _DIRECTORY_EXPORT_FORMATS:
+                return WorkspaceDownloadResult(
+                    workspace_path=workspace_path,
+                    local_path=os.path.expanduser(local_destination),
+                    export_format=normalized_format,
+                    success=False,
+                    error=(
+                        "Directory exports only support export_format values: "
+                        f"{', '.join(sorted(_DIRECTORY_EXPORT_FORMATS))}."
+                    ),
+                )
+
+        response = w.workspace.export(path=workspace_path, format=ExportFormat[normalized_format])
+        content = base64.b64decode(response.content or "")
+        local_path = _resolve_download_path(
+            local_destination=local_destination,
+            workspace_path=workspace_path,
+            info=info,
+            export_format=normalized_format,
+            response_file_type=response.file_type,
+        )
+
+        if os.path.exists(local_path) and not overwrite:
+            return WorkspaceDownloadResult(
+                workspace_path=workspace_path,
+                local_path=local_path,
+                export_format=normalized_format,
+                success=False,
+                error=f"Local file already exists: {local_path}",
+            )
+
+        parent_dir = str(Path(local_path).parent)
+        if parent_dir and not os.path.exists(parent_dir):
+            os.makedirs(parent_dir)
+
+        with open(local_path, "wb") as f:
+            f.write(content)
+
+        return WorkspaceDownloadResult(
+            workspace_path=workspace_path,
+            local_path=local_path,
+            export_format=normalized_format,
+            success=True,
+        )
+    except Exception as e:
+        return WorkspaceDownloadResult(
+            workspace_path=workspace_path,
+            local_path=os.path.expanduser(local_destination),
+            export_format=normalized_format,
+            success=False,
+            error=str(e),
+        )
 
 
 def _detect_notebook_language(local_path: str, content: bytes) -> Optional[Language]:

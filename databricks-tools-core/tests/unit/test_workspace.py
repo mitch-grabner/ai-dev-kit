@@ -6,16 +6,20 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+from databricks.sdk.service.workspace import ExportFormat, Language, ObjectInfo, ObjectType
 
 from databricks_tools_core.file.workspace import (
-    upload_to_workspace,
-    delete_from_workspace,
     _collect_files,
     _collect_directories,
     _is_protected_path,
-    UploadResult,
-    FolderUploadResult,
     DeleteResult,
+    FolderUploadResult,
+    UploadResult,
+    delete_from_workspace,
+    download_from_workspace,
+    get_workspace_object_info,
+    list_workspace_objects,
+    upload_to_workspace,
 )
 
 
@@ -442,3 +446,256 @@ class TestDeleteFromWorkspace:
 
         assert not result.success
         assert "Not found" in result.error
+
+
+class TestListWorkspaceObjects:
+    """Tests for listing workspace objects."""
+
+    @mock.patch("databricks_tools_core.file.workspace.get_workspace_client")
+    def test_maps_sdk_object_info(self, mock_get_client):
+        mock_client = mock.Mock()
+        mock_client.workspace.list.return_value = [
+            ObjectInfo(
+                path="/Workspace/Users/test@example.com/notebook",
+                object_type=ObjectType.NOTEBOOK,
+                language=Language.PYTHON,
+                size=123,
+                created_at=1000,
+                modified_at=2000,
+                object_id=42,
+            )
+        ]
+        mock_get_client.return_value = mock_client
+
+        result = list_workspace_objects("/Workspace/Users/test@example.com")
+
+        assert result.error is None
+        assert result.returned_count == 1
+        assert result.truncated is False
+        assert result.objects[0].to_dict() == {
+            "path": "/Workspace/Users/test@example.com/notebook",
+            "object_type": "NOTEBOOK",
+            "language": "PYTHON",
+            "size": 123,
+            "created_at": 1000,
+            "modified_at": 2000,
+            "object_id": 42,
+            "error": None,
+        }
+
+    @mock.patch("databricks_tools_core.file.workspace.get_workspace_client")
+    def test_recursive_listing_walks_directories_and_truncates(self, mock_get_client):
+        mock_client = mock.Mock()
+
+        def list_side_effect(path, notebooks_modified_after=None):
+            if path == "/Workspace/Users/test@example.com":
+                return [
+                    ObjectInfo(path="/Workspace/Users/test@example.com/dir", object_type=ObjectType.DIRECTORY),
+                    ObjectInfo(path="/Workspace/Users/test@example.com/top.py", object_type=ObjectType.FILE),
+                ]
+            if path == "/Workspace/Users/test@example.com/dir":
+                return [
+                    ObjectInfo(path="/Workspace/Users/test@example.com/dir/a.py", object_type=ObjectType.FILE),
+                    ObjectInfo(path="/Workspace/Users/test@example.com/dir/b.py", object_type=ObjectType.FILE),
+                ]
+            return []
+
+        mock_client.workspace.list.side_effect = list_side_effect
+        mock_get_client.return_value = mock_client
+
+        result = list_workspace_objects(
+            "/Workspace/Users/test@example.com",
+            recursive=True,
+            max_results=2,
+        )
+
+        assert result.error is None
+        assert result.returned_count == 2
+        assert result.truncated is True
+        assert [obj.path for obj in result.objects] == [
+            "/Workspace/Users/test@example.com/dir",
+            "/Workspace/Users/test@example.com/dir/a.py",
+        ]
+
+    @mock.patch("databricks_tools_core.file.workspace.get_workspace_client")
+    def test_filters_object_type_and_name(self, mock_get_client):
+        mock_client = mock.Mock()
+        mock_client.workspace.list.return_value = [
+            ObjectInfo(path="/Workspace/Users/test@example.com/keep_notebook", object_type=ObjectType.NOTEBOOK),
+            ObjectInfo(path="/Workspace/Users/test@example.com/skip_notebook", object_type=ObjectType.NOTEBOOK),
+            ObjectInfo(path="/Workspace/Users/test@example.com/keep_file.py", object_type=ObjectType.FILE),
+        ]
+        mock_get_client.return_value = mock_client
+
+        result = list_workspace_objects(
+            "/Workspace/Users/test@example.com",
+            object_type_filter="NOTEBOOK",
+            name_contains="keep",
+        )
+
+        assert result.error is None
+        assert [obj.path for obj in result.objects] == ["/Workspace/Users/test@example.com/keep_notebook"]
+
+    @mock.patch("databricks_tools_core.file.workspace.get_workspace_client")
+    def test_invalid_object_type_returns_error(self, mock_get_client):
+        result = list_workspace_objects(
+            "/Workspace/Users/test@example.com",
+            object_type_filter="BAD_TYPE",
+        )
+
+        assert "Invalid object_type_filter" in result.error
+        mock_get_client.assert_not_called()
+
+
+class TestGetWorkspaceObjectInfo:
+    """Tests for workspace object metadata."""
+
+    @mock.patch("databricks_tools_core.file.workspace.get_workspace_client")
+    def test_returns_object_info(self, mock_get_client):
+        mock_client = mock.Mock()
+        mock_client.workspace.get_status.return_value = ObjectInfo(
+            path="/Workspace/Users/test@example.com/file.py",
+            object_type=ObjectType.FILE,
+            size=10,
+        )
+        mock_get_client.return_value = mock_client
+
+        result = get_workspace_object_info("/Workspace/Users/test@example.com/file.py")
+
+        assert result.path == "/Workspace/Users/test@example.com/file.py"
+        assert result.object_type == "FILE"
+        assert result.size == 10
+        assert result.error is None
+
+    @mock.patch("databricks_tools_core.file.workspace.get_workspace_client")
+    def test_returns_error_on_sdk_failure(self, mock_get_client):
+        mock_client = mock.Mock()
+        mock_client.workspace.get_status.side_effect = Exception("missing")
+        mock_get_client.return_value = mock_client
+
+        result = get_workspace_object_info("/Workspace/Users/test@example.com/missing")
+
+        assert result.path == "/Workspace/Users/test@example.com/missing"
+        assert "missing" in result.error
+
+
+class TestDownloadFromWorkspace:
+    """Tests for workspace export/download."""
+
+    @mock.patch("databricks_tools_core.file.workspace.get_workspace_client")
+    def test_download_decodes_base64_and_creates_parent_dirs(self, mock_get_client, tmp_path):
+        mock_client = mock.Mock()
+        mock_client.workspace.get_status.return_value = ObjectInfo(
+            path="/Workspace/Users/test@example.com/notebook",
+            object_type=ObjectType.NOTEBOOK,
+            language=Language.PYTHON,
+        )
+        mock_client.workspace.export.return_value = mock.Mock(
+            content="cHJpbnQoJ2hpJykK",
+            file_type="SOURCE",
+        )
+        mock_get_client.return_value = mock_client
+
+        destination = tmp_path / "nested" / "download.py"
+        result = download_from_workspace(
+            "/Workspace/Users/test@example.com/notebook",
+            str(destination),
+        )
+
+        assert result.success
+        assert destination.read_text() == "print('hi')\n"
+        mock_client.workspace.export.assert_called_once_with(
+            path="/Workspace/Users/test@example.com/notebook",
+            format=ExportFormat.SOURCE,
+        )
+
+    @mock.patch("databricks_tools_core.file.workspace.get_workspace_client")
+    def test_download_to_directory_derives_filename(self, mock_get_client, tmp_path):
+        mock_client = mock.Mock()
+        mock_client.workspace.get_status.return_value = ObjectInfo(
+            path="/Workspace/Users/test@example.com/notebook",
+            object_type=ObjectType.NOTEBOOK,
+            language=Language.PYTHON,
+        )
+        mock_client.workspace.export.return_value = mock.Mock(content="eA==", file_type="SOURCE")
+        mock_get_client.return_value = mock_client
+
+        result = download_from_workspace(
+            "/Workspace/Users/test@example.com/notebook",
+            str(tmp_path),
+        )
+
+        assert result.success
+        assert result.local_path == str(tmp_path / "notebook.py")
+        assert (tmp_path / "notebook.py").read_text() == "x"
+
+    @mock.patch("databricks_tools_core.file.workspace.get_workspace_client")
+    def test_download_respects_overwrite_false(self, mock_get_client, tmp_path):
+        existing = tmp_path / "file.py"
+        existing.write_text("old")
+        mock_client = mock.Mock()
+        mock_client.workspace.get_status.return_value = ObjectInfo(
+            path="/Workspace/Users/test@example.com/file.py",
+            object_type=ObjectType.FILE,
+        )
+        mock_client.workspace.export.return_value = mock.Mock(content="bmV3", file_type="SOURCE")
+        mock_get_client.return_value = mock_client
+
+        result = download_from_workspace(
+            "/Workspace/Users/test@example.com/file.py",
+            str(existing),
+            overwrite=False,
+        )
+
+        assert not result.success
+        assert "already exists" in result.error
+        assert existing.read_text() == "old"
+
+    @mock.patch("databricks_tools_core.file.workspace.get_workspace_client")
+    def test_directory_download_requires_recursive(self, mock_get_client, tmp_path):
+        mock_client = mock.Mock()
+        mock_client.workspace.get_status.return_value = ObjectInfo(
+            path="/Workspace/Users/test@example.com/project",
+            object_type=ObjectType.DIRECTORY,
+        )
+        mock_get_client.return_value = mock_client
+
+        result = download_from_workspace(
+            "/Workspace/Users/test@example.com/project",
+            str(tmp_path),
+            recursive=False,
+        )
+
+        assert not result.success
+        assert "recursive=True" in result.error
+        mock_client.workspace.export.assert_not_called()
+
+    @mock.patch("databricks_tools_core.file.workspace.get_workspace_client")
+    def test_directory_download_validates_export_format(self, mock_get_client, tmp_path):
+        mock_client = mock.Mock()
+        mock_client.workspace.get_status.return_value = ObjectInfo(
+            path="/Workspace/Users/test@example.com/project",
+            object_type=ObjectType.DIRECTORY,
+        )
+        mock_get_client.return_value = mock_client
+
+        result = download_from_workspace(
+            "/Workspace/Users/test@example.com/project",
+            str(tmp_path),
+            export_format="HTML",
+            recursive=True,
+        )
+
+        assert not result.success
+        assert "Directory exports only support" in result.error
+        mock_client.workspace.export.assert_not_called()
+
+    def test_invalid_export_format_returns_error(self, tmp_path):
+        result = download_from_workspace(
+            "/Workspace/Users/test@example.com/file.py",
+            str(tmp_path / "file.py"),
+            export_format="BAD",
+        )
+
+        assert not result.success
+        assert "Invalid export_format" in result.error

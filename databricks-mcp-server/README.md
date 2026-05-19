@@ -99,7 +99,7 @@ Claude now has both:
 
 | Tool | Description |
 |------|-------------|
-| `upload_to_workspace` | Upload files/folders to workspace (works like `cp` - handles files, folders, globs) |
+| `manage_workspace_files` | List, inspect, upload, download/export, and delete workspace files/notebooks under `/Workspace/...` |
 
 ### Jobs
 

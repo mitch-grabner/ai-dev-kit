@@ -75,5 +75,6 @@ app = manage_app(action="get", name="my-dashboard", include_logs=True)
 ## Notes
 
 - Add resources (SQL warehouse, Lakebase, etc.) via the Databricks Apps UI after creating the app
+- `manage_workspace_files` can also list, inspect, and download/export `/Workspace/...` files and notebooks when you need to retrieve existing app notebooks or source files
 - MCP tools use the service principal's permissions — ensure it has access to required resources
 - For manual deployment, see [4-deployment.md](4-deployment.md)

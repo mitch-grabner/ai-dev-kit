@@ -156,7 +156,7 @@ manage_pipeline_run(
 
 | Tool | Description |
 |------|-------------|
-| `manage_workspace_files(action="upload")` | Upload files/folders to workspace |
+| `manage_workspace_files` | List, inspect, upload, download/export, and delete workspace files/notebooks |
 | `get_table_stats_and_schema` | **Use this to validate tables** - returns schema, row counts, and stats in one call |
 | `execute_sql` | Run ad-hoc SQL to inspect actual data content (not for row counts) |
 

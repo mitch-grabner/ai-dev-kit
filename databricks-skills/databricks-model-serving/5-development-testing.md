@@ -85,7 +85,7 @@ print("Response:", result.model_dump(exclude_none=True))
 
 ## Step 2: Upload to Workspace
 
-Use the `manage_workspace_files` MCP tool:
+Use the `manage_workspace_files` MCP tool. It supports upload plus workspace list/get_info/download for retrieving existing notebooks or source:
 
 ```
 manage_workspace_files(

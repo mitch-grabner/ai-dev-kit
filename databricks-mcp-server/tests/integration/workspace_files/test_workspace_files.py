@@ -585,3 +585,51 @@ class TestNotebookUpload:
 
         finally:
             Path(temp_path).unlink(missing_ok=True)
+
+    def test_list_and_download_notebook_source(
+        self,
+        workspace_client: WorkspaceClient,
+        workspace_test_path: str,
+    ):
+        """Should list an uploaded notebook and download it as SOURCE."""
+        notebook_source = (
+            "# Databricks notebook source\n"
+            "print('download me')\n"
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(notebook_source)
+            local_notebook = f.name
+
+        notebook_path = f"{workspace_test_path}/downloadable_notebook"
+        try:
+            upload_result = manage_workspace_files(
+                action="upload",
+                local_path=local_notebook,
+                workspace_path=notebook_path,
+                overwrite=True,
+            )
+            assert upload_result.get("success", False), f"Upload failed: {upload_result}"
+
+            list_result = manage_workspace_files(
+                action="list",
+                workspace_path=workspace_test_path,
+                object_type_filter="NOTEBOOK",
+                name_contains="downloadable",
+            )
+            assert list_result.get("error") is None
+            paths = [obj["path"] for obj in list_result["objects"]]
+            assert notebook_path in paths
+
+            with tempfile.TemporaryDirectory() as download_dir:
+                download_result = manage_workspace_files(
+                    action="download",
+                    workspace_path=notebook_path,
+                    local_destination=download_dir,
+                    export_format="SOURCE",
+                )
+                assert download_result.get("success", False), f"Download failed: {download_result}"
+                downloaded = Path(download_result["local_path"])
+                assert downloaded.exists()
+                assert "print('download me')" in downloaded.read_text()
+        finally:
+            Path(local_notebook).unlink(missing_ok=True)
