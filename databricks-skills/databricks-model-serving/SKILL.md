@@ -182,7 +182,7 @@ Then deploy via UI or SDK. See [1-classical-ml.md](1-classical-ml.md).
 
 | Tool | Purpose |
 |------|---------|
-| `manage_workspace_files` (action="upload") | Upload agent files to workspace |
+| `manage_workspace_files` | List, inspect, upload, download/export, and delete workspace files/notebooks |
 | `execute_code` | Install packages, test agent, log model |
 
 ### Deployment
